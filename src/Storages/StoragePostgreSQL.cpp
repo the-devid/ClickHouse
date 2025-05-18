@@ -76,7 +76,7 @@ namespace ErrorCodes
 StoragePostgreSQL::StoragePostgreSQL(
     const StorageID & table_id_,
     postgres::PoolWithFailoverPtr pool_,
-    const String & remote_table_name_,
+    const TableNameOrQuery & remote_table_or_query_,
     const ColumnsDescription & columns_,
     const ConstraintsDescription & constraints_,
     const String & comment,
@@ -84,7 +84,7 @@ StoragePostgreSQL::StoragePostgreSQL(
     const String & remote_table_schema_,
     const String & on_conflict_)
     : IStorage(table_id_)
-    , remote_table_name(remote_table_name_)
+    , remote_table_or_query(remote_table_or_query_)
     , remote_table_schema(remote_table_schema_)
     , on_conflict(on_conflict_)
     , pool(std::move(pool_))
@@ -94,7 +94,7 @@ StoragePostgreSQL::StoragePostgreSQL(
 
     if (columns_.empty())
     {
-        auto columns = getTableStructureFromData(pool, remote_table_name, remote_table_schema, context_);
+        auto columns = getTableStructureFromData(pool, remote_table_or_query, remote_table_schema, context_);
         storage_metadata.setColumns(columns);
     }
     else
@@ -107,14 +107,14 @@ StoragePostgreSQL::StoragePostgreSQL(
 
 ColumnsDescription StoragePostgreSQL::getTableStructureFromData(
     const postgres::PoolWithFailoverPtr & pool_,
-    const String & table,
+    const TableNameOrQuery & table_or_query,
     const String & schema,
     const ContextPtr & context_)
 {
     const bool use_nulls = context_->getSettingsRef()[Setting::external_table_functions_use_nulls];
     auto connection_holder = pool_->get();
     auto columns_info = fetchPostgreSQLTableStructure(
-            connection_holder->get(), table, schema, use_nulls).physical_columns;
+            connection_holder->get(), table_or_query.getTableName(), schema, use_nulls).physical_columns;
 
     if (!columns_info)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Table structure not returned");
@@ -211,7 +211,7 @@ void StoragePostgreSQL::read(
         sample_block,
         max_block_size,
         remote_table_schema,
-        remote_table_name,
+        remote_table_or_query.getTableName(),
         pool->get());
     query_plan.addStep(std::move(reading));
 }
@@ -526,7 +526,7 @@ private:
 SinkToStoragePtr StoragePostgreSQL::write(
         const ASTPtr & /*query*/, const StorageMetadataPtr & metadata_snapshot, ContextPtr /* context */, bool /*async_insert*/)
 {
-    return std::make_shared<PostgreSQLSink>(metadata_snapshot, pool->get(), remote_table_name, remote_table_schema, on_conflict);
+    return std::make_shared<PostgreSQLSink>(metadata_snapshot, pool->get(), remote_table_or_query.getTableName(), remote_table_schema, on_conflict);
 }
 
 StoragePostgreSQL::Configuration StoragePostgreSQL::processNamedCollectionResult(const NamedCollection & named_collection, ContextPtr context_, bool require_table)
@@ -557,7 +557,7 @@ StoragePostgreSQL::Configuration StoragePostgreSQL::processNamedCollectionResult
     configuration.password = named_collection.get<String>("password");
     configuration.database = named_collection.getAny<String>({"db", "database"});
     if (require_table)
-        configuration.table = named_collection.get<String>("table");
+        configuration.table_or_query = TableNameOrQuery(TableNameOrQuery::Type::TABLE, named_collection.get<String>("table"));
     configuration.schema = named_collection.getOrDefault<String>("schema", "");
     configuration.on_conflict = named_collection.getOrDefault<String>("on_conflict", "");
 
@@ -596,7 +596,8 @@ StoragePostgreSQL::Configuration StoragePostgreSQL::getConfiguration(ASTs engine
             configuration.port = configuration.addresses[0].second;
         }
         configuration.database = checkAndGetLiteralArgument<String>(engine_args[1], "database");
-        configuration.table = checkAndGetLiteralArgument<String>(engine_args[2], "table");
+        configuration.table_or_query
+            = TableNameOrQuery(TableNameOrQuery::Type::TABLE, checkAndGetLiteralArgument<String>(engine_args[2], "table"));
         configuration.username = checkAndGetLiteralArgument<String>(engine_args[3], "user");
         configuration.password = checkAndGetLiteralArgument<String>(engine_args[4], "password");
 
@@ -629,7 +630,7 @@ void registerStoragePostgreSQL(StorageFactory & factory)
         return std::make_shared<StoragePostgreSQL>(
             args.table_id,
             std::move(pool),
-            configuration.table,
+            configuration.table_or_query,
             args.columns,
             args.constraints,
             args.comment,

@@ -603,6 +603,13 @@ void registerStorageMaterializedPostgreSQL(StorageFactory & factory)
             metadata.primary_key = KeyDescription::getKeyFromAST(args.storage_def->order_by->ptr(), metadata.columns, args.getContext());
 
         auto configuration = StoragePostgreSQL::getConfiguration(args.engine_args, args.getContext());
+        switch (configuration.table_or_query.getType())
+        {
+            case TableNameOrQuery::Type::TABLE:
+                break;
+            case TableNameOrQuery::Type::QUERY:
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Storage MaterializedPostgreSQL does not support queries");
+        }
         auto connection_info = postgres::formatConnectionString(
             configuration.database,
             configuration.host,
@@ -618,7 +625,7 @@ void registerStorageMaterializedPostgreSQL(StorageFactory & factory)
             postgresql_replication_settings->loadFromQuery(*args.storage_def);
 
         return std::make_shared<StorageMaterializedPostgreSQL>(
-                args.table_id, args.mode, configuration.database, configuration.table, connection_info,
+                args.table_id, args.mode, configuration.database, configuration.table_or_query.getTableName(), connection_info,
                 metadata, args.getContext(),
                 std::move(postgresql_replication_settings));
     };

@@ -11,6 +11,7 @@
 #include <Common/RemoteHostFilter.h>
 #include <Common/thread_local_rng.h>
 
+#include <Core/NamesAndTypes.h>
 #include <Core/Settings.h>
 #include <Core/PostgreSQL/PoolWithFailover.h>
 
@@ -35,6 +36,8 @@
 
 #include <Parsers/getInsertQuery.h>
 #include <Parsers/ASTFunction.h>
+#include <Parsers/ASTLiteral.h>
+#include <Parsers/ASTSubquery.h>
 
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <Processors/QueryPlan/SourceStepWithFilter.h>
@@ -71,6 +74,45 @@ namespace ErrorCodes
     extern const int NOT_IMPLEMENTED;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
     extern const int BAD_ARGUMENTS;
+    extern const int LOGICAL_ERROR;
+    extern const int INCORRECT_QUERY;
+}
+
+namespace
+{
+
+ColumnsDescription fetchQueryResultStructure(pqxx::connection & conn, const String & query, bool use_nulls)
+{
+    pqxx::ReadTransaction tx(conn);
+    auto prelimited_query = fmt::format("SELECT * FROM ({}) AS t", query);
+    auto limited_query = prelimited_query + " LIMIT 0";
+
+    const auto result = tx.exec(limited_query);
+    const auto column_count = result.columns();
+    if (column_count == 0)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "When fetching result structure, result has no columns for query: {}", query);
+
+    bool has_array_type = false;
+    NamesAndTypes columns_description;
+
+    for (auto i = 0; i < column_count; ++i)
+    {
+        String column_name = result.column_name(i);
+        auto column_type = result.column_type(i);
+        auto column_type_mod = result.column_type_modifier(i);
+
+        auto column_info = tx.exec(fmt::format("SELECT format_type({}, {}), typnotnull FROM pg_type", column_type, column_type_mod));
+        auto formatted_type = column_info[0][0].as<std::string>();
+
+        auto converted_type = convertPostgreSQLDataType(formatted_type, [&has_array_type] { has_array_type = true; }, use_nulls && !column_info[0][1].as<bool>());
+        columns_description.push_back(NameAndTypePair(column_name, converted_type));
+    }
+    if (has_array_type)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Array types are not supported in queries to PostgreSQL");
+    tx.commit();
+    return ColumnsDescription::fromNamesAndTypes(columns_description);
+}
+
 }
 
 StoragePostgreSQL::StoragePostgreSQL(
@@ -113,13 +155,21 @@ ColumnsDescription StoragePostgreSQL::getTableStructureFromData(
 {
     const bool use_nulls = context_->getSettingsRef()[Setting::external_table_functions_use_nulls];
     auto connection_holder = pool_->get();
-    auto columns_info = fetchPostgreSQLTableStructure(
-            connection_holder->get(), table_or_query.getTableName(), schema, use_nulls).physical_columns;
-
-    if (!columns_info)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Table structure not returned");
-
-    return ColumnsDescription{columns_info->columns};
+    switch (table_or_query.getType())
+    {
+        case TableNameOrQuery::Type::TABLE:
+        {
+            auto columns_info = fetchPostgreSQLTableStructure(
+                    connection_holder->get(), table_or_query.getTableName(), schema, use_nulls).physical_columns;
+            if (!columns_info)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Table structure not returned");
+            return ColumnsDescription{columns_info->columns};
+        }
+        case TableNameOrQuery::Type::QUERY:
+        {
+            return fetchQueryResultStructure(connection_holder->get(), table_or_query.getQuery(), use_nulls);
+        }
+    }
 }
 
 namespace
@@ -136,13 +186,13 @@ public:
         Block sample_block,
         size_t max_block_size_,
         String remote_table_schema_,
-        String remote_table_name_,
+        TableNameOrQuery remote_table_or_query_,
         postgres::ConnectionHolderPtr connection_)
         : SourceStepWithFilter(std::move(sample_block), column_names_, query_info_, storage_snapshot_, context_)
         , logger(getLogger("ReadFromPostgreSQL"))
         , max_block_size(max_block_size_)
         , remote_table_schema(remote_table_schema_)
-        , remote_table_name(remote_table_name_)
+        , remote_table_or_query(remote_table_or_query_)
         , connection(std::move(connection_))
     {
     }
@@ -157,16 +207,30 @@ public:
 
         /// Connection is already made to the needed database, so it should not be present in the query;
         /// remote_table_schema is empty if it is not specified, will access only table_name.
-        String query = transformQueryForExternalDatabase(
-            query_info,
-            required_source_columns,
-            storage_snapshot->metadata->getColumns().getOrdinary(),
-            IdentifierQuotingStyle::DoubleQuotes,
-            LiteralEscapingStyle::PostgreSQL,
-            remote_table_schema,
-            remote_table_name,
-            context,
-            transform_query_limit);
+        String query;
+        switch (remote_table_or_query.getType())
+        {
+            case TableNameOrQuery::Type::TABLE:
+                query = transformQueryForExternalDatabase(
+                    query_info,
+                    required_source_columns,
+                    storage_snapshot->metadata->getColumns().getOrdinary(),
+                    IdentifierQuotingStyle::DoubleQuotes,
+                    LiteralEscapingStyle::PostgreSQL,
+                    remote_table_schema,
+                    remote_table_or_query.getTableName(),
+                    context,
+                    transform_query_limit);
+                break;
+
+            case TableNameOrQuery::Type::QUERY:
+                auto quoted_columns = required_source_columns;
+                for (auto & column : quoted_columns)
+                    column = doubleQuoteString(column);
+                query = fmt::format("SELECT {} FROM ({}) AS t", fmt::join(quoted_columns, ", "), remote_table_or_query.getQuery());
+                break;
+        }
+
         LOG_TRACE(logger, "Query: {}", query);
 
         pipeline.init(Pipe(std::make_shared<PostgreSQLSource<>>(std::move(connection), query, getOutputHeader(), max_block_size)));
@@ -175,7 +239,7 @@ public:
     LoggerPtr logger;
     size_t max_block_size;
     String remote_table_schema;
-    String remote_table_name;
+    TableNameOrQuery remote_table_or_query;
     postgres::ConnectionHolderPtr connection;
 };
 
@@ -211,7 +275,7 @@ void StoragePostgreSQL::read(
         sample_block,
         max_block_size,
         remote_table_schema,
-        remote_table_or_query.getTableName(),
+        remote_table_or_query,
         pool->get());
     query_plan.addStep(std::move(reading));
 }
@@ -526,7 +590,15 @@ private:
 SinkToStoragePtr StoragePostgreSQL::write(
         const ASTPtr & /*query*/, const StorageMetadataPtr & metadata_snapshot, ContextPtr /* context */, bool /*async_insert*/)
 {
-    return std::make_shared<PostgreSQLSink>(metadata_snapshot, pool->get(), remote_table_or_query.getTableName(), remote_table_schema, on_conflict);
+    switch (remote_table_or_query.getType())
+    {
+        case TableNameOrQuery::Type::TABLE:
+            return std::make_shared<PostgreSQLSink>(
+                metadata_snapshot, pool->get(), remote_table_or_query.getTableName(), remote_table_schema, on_conflict);
+
+        case TableNameOrQuery::Type::QUERY:
+            throw Exception(ErrorCodes::INCORRECT_QUERY, "Can't write to read-only PostgreSQL query result");
+    }
 }
 
 StoragePostgreSQL::Configuration StoragePostgreSQL::processNamedCollectionResult(const NamedCollection & named_collection, ContextPtr context_, bool require_table)
@@ -534,7 +606,12 @@ StoragePostgreSQL::Configuration StoragePostgreSQL::processNamedCollectionResult
     StoragePostgreSQL::Configuration configuration;
     ValidateKeysMultiset<ExternalDatabaseEqualKeysSet> required_arguments = {"user", "username", "password", "database", "db"};
     if (require_table)
-        required_arguments.insert("table");
+    {
+        if (named_collection.has("query"))
+            required_arguments.insert("query");
+        else
+            required_arguments.insert("table");
+    }
 
     validateNamedCollection<ValidateKeysMultiset<ExternalDatabaseEqualKeysSet>>(
         named_collection, required_arguments, {"schema", "on_conflict", "addresses_expr", "host", "hostname", "port", "use_table_cache"});
@@ -557,7 +634,13 @@ StoragePostgreSQL::Configuration StoragePostgreSQL::processNamedCollectionResult
     configuration.password = named_collection.get<String>("password");
     configuration.database = named_collection.getAny<String>({"db", "database"});
     if (require_table)
-        configuration.table_or_query = TableNameOrQuery(TableNameOrQuery::Type::TABLE, named_collection.get<String>("table"));
+    {
+        auto table_or_query = named_collection.getAny<String>({"table", "query"});
+        if (named_collection.has("table"))
+            configuration.table_or_query = TableNameOrQuery(TableNameOrQuery::Type::TABLE, table_or_query);
+        else
+            configuration.table_or_query = TableNameOrQuery(TableNameOrQuery::Type::QUERY, table_or_query);
+    }
     configuration.schema = named_collection.getOrDefault<String>("schema", "");
     configuration.on_conflict = named_collection.getOrDefault<String>("on_conflict", "");
 
@@ -578,14 +661,35 @@ StoragePostgreSQL::Configuration StoragePostgreSQL::getConfiguration(ASTs engine
             throw Exception(
                 ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
                 "Storage PostgreSQL requires from 5 to 7 parameters: "
-                "PostgreSQL('host:port', 'database', 'table', 'username', 'password' "
+                "PostgreSQL('host:port', 'database', 'table' (or query), 'username', 'password' "
                 "[, 'schema', 'ON CONFLICT ...']. Got: {}",
                 engine_args.size());
         }
 
-        for (auto & engine_arg : engine_args)
-            engine_arg = evaluateConstantExpressionOrIdentifierAsLiteral(engine_arg, context);
+        std::optional<String> maybe_query;
+        if (auto * subquery_ast = engine_args[2]->as<ASTSubquery>())
+        {
+            maybe_query = subquery_ast->children[0]->formatWithSecretsOneLine();
+        }
+        else if (auto * function_ast = engine_args[2]->as<ASTFunction>(); function_ast && function_ast->name == "query")
+        {
+            if (function_ast->arguments->children.size() != 1)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Storage PostgreSQL expects exactly one argument in query() function");
 
+            auto evaluated_query_arg = evaluateConstantExpressionOrIdentifierAsLiteral(function_ast->arguments->children[0], context);
+            auto * query_lit = evaluated_query_arg->as<ASTLiteral>();
+
+            if (!query_lit || query_lit->value.getType() != Field::Types::String)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Storage PostgreSQL expects string literal inside query()");
+            maybe_query = query_lit->value.safeGet<String>();
+        }
+        for (size_t i = 0; i < engine_args.size(); ++i)
+        {
+            auto & engine_arg = engine_args[i];
+            if (i == 2 && maybe_query)
+                continue;
+            engine_arg = evaluateConstantExpressionOrIdentifierAsLiteral(engine_arg, context);
+        }
         configuration.addresses_expr = checkAndGetLiteralArgument<String>(engine_args[0], "host:port");
         size_t max_addresses = context->getSettingsRef()[Setting::glob_expansion_max_elements];
 
@@ -596,8 +700,11 @@ StoragePostgreSQL::Configuration StoragePostgreSQL::getConfiguration(ASTs engine
             configuration.port = configuration.addresses[0].second;
         }
         configuration.database = checkAndGetLiteralArgument<String>(engine_args[1], "database");
-        configuration.table_or_query
-            = TableNameOrQuery(TableNameOrQuery::Type::TABLE, checkAndGetLiteralArgument<String>(engine_args[2], "table"));
+        if (maybe_query)
+            configuration.table_or_query = TableNameOrQuery(TableNameOrQuery::Type::QUERY, *maybe_query);
+        else
+            configuration.table_or_query
+                = TableNameOrQuery(TableNameOrQuery::Type::TABLE, checkAndGetLiteralArgument<String>(engine_args[2], "table"));
         configuration.username = checkAndGetLiteralArgument<String>(engine_args[3], "user");
         configuration.password = checkAndGetLiteralArgument<String>(engine_args[4], "password");
 

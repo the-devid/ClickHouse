@@ -38,6 +38,8 @@ public:
     static constexpr auto name = "postgresql";
     std::string getName() const override { return name; }
 
+    std::vector<size_t> skipAnalysisForArguments(const QueryTreeNodePtr &, ContextPtr) const override { return {2}; }
+
 private:
     StoragePtr executeImpl(
             const ASTPtr & ast_function, ContextPtr context,
@@ -58,7 +60,7 @@ StoragePtr TableFunctionPostgreSQL::executeImpl(const ASTPtr & /*ast_function*/,
     auto result = std::make_shared<StoragePostgreSQL>(
         StorageID(getDatabaseName(), table_name),
         connection_pool,
-        configuration->table,
+        configuration->table_or_query,
         cached_columns,
         ConstraintsDescription{},
         String{},
@@ -73,7 +75,7 @@ StoragePtr TableFunctionPostgreSQL::executeImpl(const ASTPtr & /*ast_function*/,
 
 ColumnsDescription TableFunctionPostgreSQL::getActualTableStructure(ContextPtr context, bool /*is_insert_query*/) const
 {
-    return StoragePostgreSQL::getTableStructureFromData(connection_pool, configuration->table, configuration->schema, context);
+    return StoragePostgreSQL::getTableStructureFromData(connection_pool, configuration->table_or_query, configuration->schema, context);
 }
 
 
